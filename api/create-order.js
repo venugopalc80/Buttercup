@@ -5,7 +5,7 @@ function validEmail(value) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value); }
 async function stripeCheckout({ secret, origin, order, items }) {
   const form = new URLSearchParams();
   form.set('mode', 'payment');
-  form.set('success_url', `${origin}/confirmation.html?payment=success`);
+  form.set('success_url', `${origin}/confirmation.html?payment=success&session_id={CHECKOUT_SESSION_ID}`);
   form.set('cancel_url', `${origin}/order.html?payment=cancelled`);
   form.set('customer_email', order.customer_email);
   form.set('metadata[order_id]', order.id);
@@ -43,7 +43,6 @@ module.exports = async function handler(req, res) {
 
     const headers = { apikey: serviceKey, Authorization: `Bearer ${serviceKey}`, 'Content-Type': 'application/json', Prefer: 'return=representation' };
     const base = `${supabaseUrl.replace(/\/$/, '')}/rest/v1`;
-
     const productsResponse = await fetch(`${base}/products?active=eq.true&select=name,price_pence`, { headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}` } });
     const products = await productsResponse.json();
     if (!productsResponse.ok) return res.status(502).json({ error: 'Could not validate the menu.' });
@@ -53,7 +52,6 @@ module.exports = async function handler(req, res) {
     const totalPence = safeItems.reduce((sum, item) => sum + item.quantity * item.unit_price_pence, 0);
     if (totalPence <= 0) return res.status(400).json({ error: 'Your basket is empty.' });
 
-    // Reserve the requested slot atomically before creating the order.
     const startTime = slot.split(' - ')[0];
     const slotResponse = await fetch(`${base}/rpc/reserve_collection_slot`, { method: 'POST', headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ p_date: date, p_start_time: startTime }) });
     const slotId = await slotResponse.json();
@@ -73,11 +71,13 @@ module.exports = async function handler(req, res) {
     }
 
     let checkoutUrl = null;
+    let stripeSessionId = null;
     if (payment === 'online') {
       try {
         const origin = req.headers.origin || `https://${req.headers.host}`;
         const session = await stripeCheckout({ secret: process.env.STRIPE_SECRET_KEY, origin, order, items: safeItems });
         checkoutUrl = session.url;
+        stripeSessionId = session.id;
         await fetch(`${base}/orders?id=eq.${encodeURIComponent(order.id)}`, { method: 'PATCH', headers, body: JSON.stringify({ stripe_checkout_session_id: session.id }) });
       } catch (stripeError) {
         await fetch(`${base}/order_items?order_id=eq.${encodeURIComponent(order.id)}`, { method: 'DELETE', headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}` } });
@@ -87,7 +87,7 @@ module.exports = async function handler(req, res) {
       }
     }
 
-    return res.status(201).json({ orderId: order.id, orderNumber, payment, totalPence, paymentStatus: 'pending', checkoutUrl });
+    return res.status(201).json({ orderId: order.id, orderNumber, payment, totalPence, paymentStatus: 'pending', checkoutUrl, stripeSessionId });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ error: 'Unexpected ordering error.' });
