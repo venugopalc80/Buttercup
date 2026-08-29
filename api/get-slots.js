@@ -25,8 +25,25 @@ module.exports = async function handler(req, res) {
     }
     if (!Array.isArray(slots)) return res.status(502).json({ error: 'Invalid availability response.' });
 
+    // Collection times are UK-local. On the selected date, hide slots whose
+    // start time has already passed. Future dates keep all available slots.
+    const ukNow = new Date();
+    const ukDate = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Europe/London',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    }).format(ukNow);
+    const ukTime = new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Europe/London',
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23'
+    }).format(ukNow);
+
     const available = slots
       .filter(s => Number(s.reserved ?? 0) < Number(s.capacity ?? 0))
+      .filter(s => date !== ukDate || String(s.start_time).slice(0, 5) > ukTime)
       .map(s => ({
         id: s.id,
         startTime: s.start_time,
