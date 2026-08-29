@@ -1,13 +1,5 @@
 const crypto = require('crypto');
 
-function json(status, body) {
-  return {
-    status,
-    headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
-    body: JSON.stringify(body)
-  };
-}
-
 function clean(value, max = 200) {
   return typeof value === 'string' ? value.trim().slice(0, max) : '';
 }
@@ -37,25 +29,52 @@ module.exports = async function handler(req, res) {
       return res.status(400).json({ error: 'Please complete all required order details.' });
     }
 
-    const safeItems = items.map((item) => ({
-      product_name: clean(item.name, 120),
-      quantity: Number.isInteger(item.qty) ? item.qty : 0,
-      unit_price_pence: Math.round(Number(item.price) * 100)
-    })).filter(item => item.product_name && item.quantity > 0 && item.quantity <= 20 && item.unit_price_pence >= 0 && item.unit_price_pence <= 100000);
+    const headers = {
+      apikey: serviceKey,
+      Authorization: `Bearer ${serviceKey}`,
+      'Content-Type': 'application/json',
+      Prefer: 'return=representation'
+    };
+    const base = `${supabaseUrl.replace(/\/$/, '')}/rest/v1`;
 
-    if (!safeItems.length || safeItems.length > 20) return res.status(400).json({ error: 'Invalid basket.' });
+    // Prices are resolved from the database. Never trust a browser-supplied price or total.
+    const productsResponse = await fetch(`${base}/products?active=eq.true&select=name,price_pence`, {
+      headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}` }
+    });
+    const products = await productsResponse.json();
+    if (!productsResponse.ok) return res.status(502).json({ error: 'Could not validate the menu.' });
+    const productMap = new Map(products.map(p => [p.name.toLowerCase(), p]));
+
+    const safeItems = items.map(item => {
+      const productName = clean(item.name, 120);
+      const product = productMap.get(productName.toLowerCase());
+      const quantity = Number.isInteger(item.qty) ? item.qty : 0;
+      if (!product || quantity < 1 || quantity > 20) return null;
+      return { product_name: product.name, quantity, unit_price_pence: product.price_pence };
+    }).filter(Boolean);
+
+    if (!safeItems.length || safeItems.length !== items.length || safeItems.length > 20) {
+      return res.status(400).json({ error: 'One or more basket items are no longer available.' });
+    }
 
     const totalPence = safeItems.reduce((sum, item) => sum + item.quantity * item.unit_price_pence, 0);
     if (totalPence <= 0) return res.status(400).json({ error: 'Your basket is empty.' });
 
     const orderNumber = `BC-${new Date().getFullYear()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
-    const headers = { apikey: serviceKey, Authorization: `Bearer ${serviceKey}`, 'Content-Type': 'application/json', Prefer: 'return=representation' };
-    const base = `${supabaseUrl.replace(/\/$/, '')}/rest/v1`;
-
-    // Create the order server-side. Never trust a browser-supplied total for payment.
     const orderResponse = await fetch(`${base}/orders`, {
       method: 'POST', headers,
-      body: JSON.stringify({ order_number: orderNumber, customer_name: name, customer_email: email, customer_phone: phone, collection_date: date, collection_slot: slot, payment_method: payment, payment_status: 'pending', order_status: 'pending', total_pence: totalPence })
+      body: JSON.stringify({
+        order_number: orderNumber,
+        customer_name: name,
+        customer_email: email,
+        customer_phone: phone,
+        collection_date: date,
+        collection_slot: slot,
+        payment_method: payment,
+        payment_status: 'pending',
+        order_status: 'pending',
+        total_pence: totalPence
+      })
     });
     const created = await orderResponse.json();
     if (!orderResponse.ok || !created[0]) return res.status(502).json({ error: 'Could not create the order.' });
@@ -66,14 +85,21 @@ module.exports = async function handler(req, res) {
       body: JSON.stringify(safeItems.map(item => ({ ...item, order_id: order.id })))
     });
     if (!itemResponse.ok) {
-      await fetch(`${base}/orders?id=eq.${encodeURIComponent(order.id)}`, { method: 'DELETE', headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}` } });
+      await fetch(`${base}/orders?id=eq.${encodeURIComponent(order.id)}`, {
+        method: 'DELETE',
+        headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}` }
+      });
       return res.status(502).json({ error: 'Could not save order items.' });
     }
 
-    // Online payment is intentionally not charged here until Stripe is configured.
-    // The next production step is creating a Stripe Checkout Session server-side and
-    // storing its session ID against this order before returning the checkout URL.
-    return res.status(201).json({ orderId: order.id, orderNumber, payment, totalPence, paymentStatus: 'pending', checkoutUrl: null });
+    return res.status(201).json({
+      orderId: order.id,
+      orderNumber,
+      payment,
+      totalPence,
+      paymentStatus: 'pending',
+      checkoutUrl: null
+    });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ error: 'Unexpected ordering error.' });
